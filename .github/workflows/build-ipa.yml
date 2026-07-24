@@ -1,0 +1,54 @@
+name: Build unsigned MeshChat IPA
+
+# Runs on GitHub's free macOS runners so you don't need a Mac.
+# Produces an unsigned .ipa you can sideload with Sideloadly (or resign
+# yourself with Xcode/Fastlane later). Trigger it manually from the
+# Actions tab, or it runs automatically on every push to main.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild \
+            -project MeshChat.xcodeproj \
+            -scheme MeshChat \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            clean build
+
+      - name: Package IPA
+        run: |
+          set -e
+          APP_PATH="build/Build/Products/Release-iphoneos/MeshChat.app"
+          mkdir -p Payload
+          cp -r "$APP_PATH" Payload/
+          zip -r MeshChat.ipa Payload -x ".*"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeshChat-ipa
+          path: MeshChat.ipa
+          retention-days: 30
