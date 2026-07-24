@@ -2,13 +2,13 @@ name: MeshChat
 options:
   bundleIdPrefix: com.sameer
   deploymentTarget:
-    iOS: "16.0"
+    iOS: "17.0"
 
 targets:
   MeshChat:
     type: application
     platform: iOS
-    deploymentTarget: "16.0"
+    deploymentTarget: "17.0"
     sources:
       - path: Sources
     info:
@@ -31,5 +31,5 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
-        IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
         GENERATE_INFOPLIST_FILE: NO
