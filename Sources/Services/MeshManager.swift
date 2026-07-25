@@ -31,6 +31,11 @@ final class MeshManager: NSObject, ObservableObject {
     /// Last time we heard anything from a given peer identity - directly
     /// connected peers are "online"; everyone else shows "last seen".
     @Published private(set) var lastSeenByPeer: [UUID: Date] = [:]
+    /// Profile picture thumbnails we've received from peers via their
+    /// identity packet, keyed by persistent identity.
+    @Published private(set) var photoByIdentity: [UUID: Data] = [:]
+    /// Your own profile picture, persisted to disk so it survives relaunches.
+    @Published private(set) var myPhotoData: Data?
 
     /// Every non-typing packet addressed to us (1:1) or broadcast as part
     /// of a group; ChatStore subscribes and decides what to do with it.
@@ -41,8 +46,14 @@ final class MeshManager: NSObject, ObservableObject {
     /// Persistent identity for THIS device/user - survives app relaunches.
     let myID: UUID
     var myDisplayName: String {
-        didSet { UserDefaults.standard.set(myDisplayName, forKey: Keys.displayName) }
+        didSet {
+            UserDefaults.standard.set(myDisplayName, forKey: Keys.displayName)
+            if didFinishInit { broadcastIdentity() }
+        }
     }
+    /// Guards against property observers firing mid-init (before the mesh
+    /// session even exists) when the saved name is first assigned.
+    private var didFinishInit = false
 
     // MARK: MultipeerConnectivity plumbing
 
@@ -74,6 +85,11 @@ final class MeshManager: NSObject, ObservableObject {
         static let displayName = "meshchat.displayName"
     }
 
+    private let myPhotoFileURL: URL = {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return docs.appendingPathComponent("meshchat_myphoto.jpg")
+    }()
+
     // MARK: Init
 
     override init() {
@@ -88,6 +104,24 @@ final class MeshManager: NSObject, ObservableObject {
         myDisplayName = savedName
         localPeerID = MCPeerID(displayName: savedName)
         super.init()
+        let photoURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("meshchat_myphoto.jpg")
+        myPhotoData = try? Data(contentsOf: photoURL)
+        didFinishInit = true
+    }
+
+    // MARK: Profile
+
+    /// Sets (or clears, if `data` is nil) your own profile picture and lets
+    /// every currently-connected peer know right away.
+    func updateMyPhoto(_ data: Data?) {
+        myPhotoData = data
+        if let data {
+            try? data.write(to: myPhotoFileURL, options: .atomic)
+        } else {
+            try? FileManager.default.removeItem(at: myPhotoFileURL)
+        }
+        broadcastIdentity()
     }
 
     // MARK: Lifecycle
@@ -111,7 +145,7 @@ final class MeshManager: NSObject, ObservableObject {
     @discardableResult
     func sendMessage(_ text: String, to destinationID: UUID, replyTo: (id: UUID, sender: String, text: String)?) -> UUID {
         let packet = MeshPacket(
-            packetID: UUID(), type: .chatMessage, originID: myID, originName: myDisplayName,
+            packetID: UUID(), type: .chatMessage, originID: myID, originName: myDisplayName, photoData: nil,
             destinationID: destinationID, groupID: nil, text: text,
             targetMessageID: nil, reactionEmoji: nil, replyToMessageID: replyTo?.id,
             groupMemberIDs: nil, groupMemberNames: nil, ttl: MeshPacket.defaultTTL, timestamp: Date()
@@ -125,7 +159,7 @@ final class MeshManager: NSObject, ObservableObject {
     @discardableResult
     func sendGroupMessage(_ text: String, groupID: UUID, replyTo: (id: UUID, sender: String, text: String)?) -> UUID {
         let packet = MeshPacket(
-            packetID: UUID(), type: .chatMessage, originID: myID, originName: myDisplayName,
+            packetID: UUID(), type: .chatMessage, originID: myID, originName: myDisplayName, photoData: nil,
             destinationID: nil, groupID: groupID, text: text,
             targetMessageID: nil, reactionEmoji: nil, replyToMessageID: replyTo?.id,
             groupMemberIDs: nil, groupMemberNames: nil, ttl: MeshPacket.defaultTTL, timestamp: Date()
@@ -139,7 +173,7 @@ final class MeshManager: NSObject, ObservableObject {
         var names: [String: String] = [:]
         for (id, name) in memberNames { names[id.uuidString] = name }
         let packet = MeshPacket(
-            packetID: UUID(), type: .groupCreate, originID: myID, originName: myDisplayName,
+            packetID: UUID(), type: .groupCreate, originID: myID, originName: myDisplayName, photoData: nil,
             destinationID: nil, groupID: groupID, text: name,
             targetMessageID: nil, reactionEmoji: nil, replyToMessageID: nil,
             groupMemberIDs: memberIDs, groupMemberNames: names, ttl: MeshPacket.defaultTTL, timestamp: Date()
@@ -172,7 +206,7 @@ final class MeshManager: NSObject, ObservableObject {
 
     private func send(_ type: PacketType, targetMessageID: UUID, text: String? = nil, reactionEmoji: String? = nil, to destinationID: UUID?, groupID: UUID?) {
         let packet = MeshPacket(
-            packetID: UUID(), type: type, originID: myID, originName: myDisplayName,
+            packetID: UUID(), type: type, originID: myID, originName: myDisplayName, photoData: nil,
             destinationID: destinationID, groupID: groupID, text: text,
             targetMessageID: targetMessageID, reactionEmoji: reactionEmoji, replyToMessageID: nil,
             groupMemberIDs: nil, groupMemberNames: nil, ttl: MeshPacket.defaultTTL, timestamp: Date()
@@ -186,7 +220,7 @@ final class MeshManager: NSObject, ObservableObject {
     func sendTyping(_ isTyping: Bool, to destinationID: UUID) {
         guard let mcPeer = mcPeerByIdentity[destinationID] else { return }
         let packet = MeshPacket(
-            packetID: UUID(), type: .typing, originID: myID, originName: myDisplayName,
+            packetID: UUID(), type: .typing, originID: myID, originName: myDisplayName, photoData: nil,
             destinationID: destinationID, groupID: nil, text: isTyping ? "1" : "0",
             targetMessageID: nil, reactionEmoji: nil, replyToMessageID: nil,
             groupMemberIDs: nil, groupMemberNames: nil, ttl: 0, timestamp: Date()
@@ -205,6 +239,11 @@ final class MeshManager: NSObject, ObservableObject {
             identityByMCPeer[mcPeer] = packet.originID
             mcPeerByIdentity[packet.originID] = mcPeer
             nameByIdentity[packet.originID] = packet.originName
+            if let photoData = packet.photoData {
+                photoByIdentity[packet.originID] = photoData
+            } else {
+                photoByIdentity.removeValue(forKey: packet.originID)
+            }
             lastSeenByPeer[packet.originID] = Date()
             refreshConnectedPeersList()
 
@@ -263,14 +302,21 @@ final class MeshManager: NSObject, ObservableObject {
     }
 
     private func sendIdentity(to peers: [MCPeerID]) {
+        guard !peers.isEmpty else { return }
         let packet = MeshPacket(
-            packetID: UUID(), type: .identity, originID: myID, originName: myDisplayName,
+            packetID: UUID(), type: .identity, originID: myID, originName: myDisplayName, photoData: myPhotoData,
             destinationID: nil, groupID: nil, text: nil,
             targetMessageID: nil, reactionEmoji: nil, replyToMessageID: nil,
             groupMemberIDs: nil, groupMemberNames: nil, ttl: 0, timestamp: Date()
         )
         guard let data = try? JSONEncoder().encode(packet) else { return }
         try? session.send(data, toPeers: peers, with: .reliable)
+    }
+
+    /// Re-sends your identity (name + photo) to everyone you're currently
+    /// connected to - called whenever either changes mid-session.
+    private func broadcastIdentity() {
+        sendIdentity(to: session.connectedPeers)
     }
 
     private func markSeen(_ id: UUID) {
@@ -290,7 +336,8 @@ final class MeshManager: NSObject, ObservableObject {
                 displayName: nameByIdentity[identity] ?? mcPeer.displayName,
                 mcPeerID: mcPeer,
                 isConnectedDirectly: true,
-                lastSeen: Date()
+                lastSeen: Date(),
+                photoData: photoByIdentity[identity]
             )
         }
     }
