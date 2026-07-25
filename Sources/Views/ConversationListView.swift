@@ -13,6 +13,15 @@ struct ConversationListView: View {
     private var regular: [Conversation] { chatStore.conversations.filter { !$0.isPinned && !$0.isArchived } }
     private var archivedCount: Int { chatStore.conversations.filter { $0.isArchived }.count }
 
+    /// Devices currently in direct range that you don't already have a chat
+    /// with - shown right on this screen so you can start talking to anyone
+    /// nearby without digging into a separate "New chat" flow.
+    private var nearbyNewPeers: [MeshPeer] {
+        mesh.connectedPeers.filter { peer in
+            !chatStore.conversations.contains(where: { $0.id == peer.id })
+        }
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -47,6 +56,23 @@ struct ConversationListView: View {
                                 Label("Archived", systemImage: "archivebox")
                                 Spacer()
                                 Text("\(archivedCount)").foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+
+                if !nearbyNewPeers.isEmpty {
+                    Section("Nearby devices") {
+                        ForEach(nearbyNewPeers) { peer in
+                            Button {
+                                pendingNewPeer = peer
+                            } label: {
+                                HStack(spacing: 12) {
+                                    AvatarView(photoData: peer.photoData, initials: initials(for: peer.displayName), tint: .green, size: 40)
+                                    Text(peer.displayName).foregroundStyle(.primary)
+                                    Spacer()
+                                    Circle().fill(Color.green).frame(width: 8, height: 8)
+                                }
                             }
                         }
                     }
@@ -101,6 +127,11 @@ struct ConversationListView: View {
 
     private var myInitials: String {
         let parts = mesh.myDisplayName.split(separator: " ")
+        return String(parts.prefix(2).compactMap { $0.first }).uppercased()
+    }
+
+    private func initials(for name: String) -> String {
+        let parts = name.split(separator: " ")
         return String(parts.prefix(2).compactMap { $0.first }).uppercased()
     }
 
