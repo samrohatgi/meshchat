@@ -118,7 +118,11 @@ struct ChatView: View {
 
     @ViewBuilder
     private func messageRow(_ message: ChatMessage) -> some View {
-        MessageBubble(message: message, showSenderName: conversation.isGroup)
+        MessageBubble(
+            message: message,
+            showSenderName: conversation.isGroup,
+            senderPhotoData: message.senderID == mesh.myID ? mesh.myPhotoData : mesh.photoByIdentity[message.senderID]
+        )
             .contextMenu {
                 Button { replyingTo = message } label: { Label("Reply", systemImage: "arrowshape.turn.up.left") }
                 Menu {
