@@ -26,15 +26,17 @@ struct ContactInfoView: View {
         chatStore.isBlocked(peerID)
     }
 
+    private var initials: String {
+        let parts = chatStore.displayName(for: peerID).split(separator: " ")
+        return String(parts.prefix(2).compactMap { $0.first }).uppercased()
+    }
+
     var body: some View {
         NavigationStack {
             List {
                 Section {
                     VStack(spacing: 8) {
-                        Circle()
-                            .fill(Color.green.opacity(0.2))
-                            .frame(width: 72, height: 72)
-                            .overlay(Image(systemName: "person.fill").font(.title).foregroundStyle(.green))
+                        AvatarView(photoData: mesh.photoByIdentity[peerID], initials: initials, tint: .green, size: 72)
                         Text(chatStore.displayName(for: peerID)).font(.title3.weight(.semibold))
                         HStack(spacing: 4) {
                             Circle().fill(isOnline ? Color.green : Color.gray).frame(width: 7, height: 7)
