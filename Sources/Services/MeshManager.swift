@@ -6,29 +6,35 @@ import UIKit
 #endif
 
 /// Owns the MultipeerConnectivity stack (Bluetooth + peer-to-peer WiFi) and
-/// implements simple flood/epidemic mesh relay on top of it:
+/// implements simple flood/epidemic mesh relay on top of it.
 ///
 ///  - Every device both advertises itself and browses for others, and
 ///    auto-invites/accepts, so the mesh forms without user setup.
-///  - Messages carry a stable `originID`/`destinationID` (not MCPeerID,
-///    which changes every session) plus a TTL.
-///  - When a node receives a chatMessage packet that isn't addressed to it,
-///    and hasn't seen that packetID before, it decrements TTL and forwards
-///    it to all its other connected peers. This lets messages hop across
-///    multiple phones to reach someone outside direct Bluetooth range.
+///  - 1:1 packets carry a stable `destinationID` (not MCPeerID, which
+///    changes every session) plus a TTL, and are relayed hop-by-hop toward
+///    that identity.
+///  - Group packets carry a `groupID` instead and use broadcast semantics:
+///    every node floods them onward to all its other connected peers.
+///    Membership filtering (deciding whether a group packet is relevant)
+///    is left to ChatStore, which knows which groups this device belongs
+///    to. That's a deliberate simplification given there's no server to
+///    hold real access control - documented as a known limitation.
 ///
 /// This is intentionally simple (no routing tables) - fine for the size of
-/// mesh this app is meant for. It trades some redundant traffic for
-/// reliability and zero configuration.
+/// mesh this app is meant for.
 final class MeshManager: NSObject, ObservableObject {
 
     // MARK: Published state
 
     @Published private(set) var connectedPeers: [MeshPeer] = []
-    @Published private(set) var isAdvertising = false
-    @Published private(set) var isBrowsing = false
-    /// A message arrived; ChatStore listens to this and files it away.
-    let incomingMessage = PassthroughSubject<(originID: UUID, originName: String, text: String, hopCount: Int, timestamp: Date), Never>()
+    @Published private(set) var typingPeerIDs: Set<UUID> = []
+    /// Last time we heard anything from a given peer identity - directly
+    /// connected peers are "online"; everyone else shows "last seen".
+    @Published private(set) var lastSeenByPeer: [UUID: Date] = [:]
+
+    /// Every non-typing packet addressed to us (1:1) or broadcast as part
+    /// of a group; ChatStore subscribes and decides what to do with it.
+    let incomingPacket = PassthroughSubject<(packet: MeshPacket, hopCount: Int), Never>()
 
     // MARK: Identity
 
@@ -50,14 +56,18 @@ final class MeshManager: NSObject, ObservableObject {
     private lazy var advertiser = MCNearbyServiceAdvertiser(peer: localPeerID, discoveryInfo: nil, serviceType: serviceType)
     private lazy var browser = MCNearbyServiceBrowser(peer: localPeerID, serviceType: serviceType)
 
-    // MCPeerID -> stable identity, once we've completed the handshake with them
+    // MCPeerID <-> stable identity, once we've completed the handshake with them
     private var identityByMCPeer: [MCPeerID: UUID] = [:]
+    private var mcPeerByIdentity: [UUID: MCPeerID] = [:]
     private var nameByIdentity: [UUID: String] = [:]
 
     // Dedup cache so flood relay doesn't loop forever
     private var seenPacketIDs = Set<UUID>()
     private var seenPacketOrder: [UUID] = []
     private let seenCacheLimit = 500
+
+    // Typing indicators auto-expire; track a clear-timer per peer.
+    private var typingClearWork: [UUID: DispatchWorkItem] = [:]
 
     private enum Keys {
         static let myID = "meshchat.myID"
@@ -87,36 +97,102 @@ final class MeshManager: NSObject, ObservableObject {
         browser.delegate = self
         advertiser.startAdvertisingPeer()
         browser.startBrowsingForPeers()
-        isAdvertising = true
-        isBrowsing = true
     }
 
     func stop() {
         advertiser.stopAdvertisingPeer()
         browser.stopBrowsingForPeers()
         session.disconnect()
-        isAdvertising = false
-        isBrowsing = false
     }
 
-    // MARK: Sending
+    // MARK: Sending - chat messages
 
-    /// Send a chat message addressed to `destinationID`. If we're directly
-    /// connected to them it goes straight there; otherwise it's flooded to
-    /// all connected peers so the mesh can relay it onward.
-    func send(text: String, to destinationID: UUID) {
+    /// Send a 1:1 chat message addressed to `destinationID`.
+    @discardableResult
+    func sendMessage(_ text: String, to destinationID: UUID, replyTo: (id: UUID, sender: String, text: String)?) -> UUID {
         let packet = MeshPacket(
-            packetID: UUID(),
-            type: .chatMessage,
-            originID: myID,
-            originName: myDisplayName,
-            destinationID: destinationID,
-            text: text,
-            ttl: MeshPacket.defaultTTL,
-            timestamp: Date()
+            packetID: UUID(), type: .chatMessage, originID: myID, originName: myDisplayName,
+            destinationID: destinationID, groupID: nil, text: text,
+            targetMessageID: nil, reactionEmoji: nil, replyToMessageID: replyTo?.id,
+            groupMemberIDs: nil, groupMemberNames: nil, ttl: MeshPacket.defaultTTL, timestamp: Date()
         )
         markSeen(packet.packetID)
         broadcast(packet, excluding: nil)
+        return packet.packetID
+    }
+
+    /// Send a chat message to every member of a group (broadcast semantics).
+    @discardableResult
+    func sendGroupMessage(_ text: String, groupID: UUID, replyTo: (id: UUID, sender: String, text: String)?) -> UUID {
+        let packet = MeshPacket(
+            packetID: UUID(), type: .chatMessage, originID: myID, originName: myDisplayName,
+            destinationID: nil, groupID: groupID, text: text,
+            targetMessageID: nil, reactionEmoji: nil, replyToMessageID: replyTo?.id,
+            groupMemberIDs: nil, groupMemberNames: nil, ttl: MeshPacket.defaultTTL, timestamp: Date()
+        )
+        markSeen(packet.packetID)
+        broadcast(packet, excluding: nil)
+        return packet.packetID
+    }
+
+    func createGroup(name: String, groupID: UUID, memberIDs: [UUID], memberNames: [UUID: String]) {
+        var names: [String: String] = [:]
+        for (id, name) in memberNames { names[id.uuidString] = name }
+        let packet = MeshPacket(
+            packetID: UUID(), type: .groupCreate, originID: myID, originName: myDisplayName,
+            destinationID: nil, groupID: groupID, text: name,
+            targetMessageID: nil, reactionEmoji: nil, replyToMessageID: nil,
+            groupMemberIDs: memberIDs, groupMemberNames: names, ttl: MeshPacket.defaultTTL, timestamp: Date()
+        )
+        markSeen(packet.packetID)
+        broadcast(packet, excluding: nil)
+    }
+
+    // MARK: Sending - receipts, reactions, edits, deletes
+
+    func sendDeliveryAck(for messageID: UUID, to destinationID: UUID?, groupID: UUID?) {
+        send(.deliveryAck, targetMessageID: messageID, to: destinationID, groupID: groupID)
+    }
+
+    func sendReadReceipt(for messageID: UUID, to destinationID: UUID?, groupID: UUID?) {
+        send(.readReceipt, targetMessageID: messageID, to: destinationID, groupID: groupID)
+    }
+
+    func sendReaction(_ emoji: String?, on messageID: UUID, to destinationID: UUID?, groupID: UUID?) {
+        send(.reaction, targetMessageID: messageID, reactionEmoji: emoji, to: destinationID, groupID: groupID)
+    }
+
+    func sendEdit(messageID: UUID, newText: String, to destinationID: UUID?, groupID: UUID?) {
+        send(.editMessage, targetMessageID: messageID, text: newText, to: destinationID, groupID: groupID)
+    }
+
+    func sendDelete(messageID: UUID, to destinationID: UUID?, groupID: UUID?) {
+        send(.deleteMessage, targetMessageID: messageID, to: destinationID, groupID: groupID)
+    }
+
+    private func send(_ type: PacketType, targetMessageID: UUID, text: String? = nil, reactionEmoji: String? = nil, to destinationID: UUID?, groupID: UUID?) {
+        let packet = MeshPacket(
+            packetID: UUID(), type: type, originID: myID, originName: myDisplayName,
+            destinationID: destinationID, groupID: groupID, text: text,
+            targetMessageID: targetMessageID, reactionEmoji: reactionEmoji, replyToMessageID: nil,
+            groupMemberIDs: nil, groupMemberNames: nil, ttl: MeshPacket.defaultTTL, timestamp: Date()
+        )
+        markSeen(packet.packetID)
+        broadcast(packet, excluding: nil)
+    }
+
+    // MARK: Sending - typing (ephemeral, direct peers only, not relayed)
+
+    func sendTyping(_ isTyping: Bool, to destinationID: UUID) {
+        guard let mcPeer = mcPeerByIdentity[destinationID] else { return }
+        let packet = MeshPacket(
+            packetID: UUID(), type: .typing, originID: myID, originName: myDisplayName,
+            destinationID: destinationID, groupID: nil, text: isTyping ? "1" : "0",
+            targetMessageID: nil, reactionEmoji: nil, replyToMessageID: nil,
+            groupMemberIDs: nil, groupMemberNames: nil, ttl: 0, timestamp: Date()
+        )
+        guard let data = try? JSONEncoder().encode(packet) else { return }
+        try? session.send(data, toPeers: [mcPeer], with: .unreliable)
     }
 
     // MARK: Handling incoming data
@@ -127,28 +203,56 @@ final class MeshManager: NSObject, ObservableObject {
         switch packet.type {
         case .identity:
             identityByMCPeer[mcPeer] = packet.originID
+            mcPeerByIdentity[packet.originID] = mcPeer
             nameByIdentity[packet.originID] = packet.originName
+            lastSeenByPeer[packet.originID] = Date()
             refreshConnectedPeersList()
 
-        case .chatMessage:
+        case .typing:
+            let isTyping = packet.text == "1"
+            nameByIdentity[packet.originID] = packet.originName
+            if isTyping {
+                typingPeerIDs.insert(packet.originID)
+                scheduleTypingClear(for: packet.originID)
+            } else {
+                typingPeerIDs.remove(packet.originID)
+                typingClearWork[packet.originID]?.cancel()
+            }
+
+        default:
             guard !seenPacketIDs.contains(packet.packetID) else { return }
             markSeen(packet.packetID)
             nameByIdentity[packet.originID] = packet.originName
+            lastSeenByPeer[packet.originID] = Date()
 
             let hopCount = MeshPacket.defaultTTL - packet.ttl
-            if packet.destinationID == myID {
-                incomingMessage.send((packet.originID, packet.originName, packet.text ?? "", hopCount, packet.timestamp))
-            } else {
-                // Not for us - relay onward if it still has hops left.
+            let isGroupPacket = packet.groupID != nil
+            let isForMe = isGroupPacket || packet.destinationID == myID
+
+            if isForMe {
+                incomingPacket.send((packet, hopCount))
+            }
+
+            if isGroupPacket {
+                // Broadcast semantics: always flood group packets onward.
+                guard packet.ttl > 0 else { return }
+                var forwarded = packet
+                forwarded.ttl -= 1
+                broadcast(forwarded, excluding: mcPeer)
+            } else if packet.destinationID != myID {
                 guard packet.ttl > 0 else { return }
                 var forwarded = packet
                 forwarded.ttl -= 1
                 broadcast(forwarded, excluding: mcPeer)
             }
-
-        case .deliveryAck:
-            break // reserved for future read-receipt support
         }
+    }
+
+    private func scheduleTypingClear(for peerID: UUID) {
+        typingClearWork[peerID]?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.typingPeerIDs.remove(peerID) }
+        typingClearWork[peerID] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: work)
     }
 
     private func broadcast(_ packet: MeshPacket, excluding excludedPeer: MCPeerID?) {
@@ -160,14 +264,10 @@ final class MeshManager: NSObject, ObservableObject {
 
     private func sendIdentity(to peers: [MCPeerID]) {
         let packet = MeshPacket(
-            packetID: UUID(),
-            type: .identity,
-            originID: myID,
-            originName: myDisplayName,
-            destinationID: nil,
-            text: nil,
-            ttl: 0,
-            timestamp: Date()
+            packetID: UUID(), type: .identity, originID: myID, originName: myDisplayName,
+            destinationID: nil, groupID: nil, text: nil,
+            targetMessageID: nil, reactionEmoji: nil, replyToMessageID: nil,
+            groupMemberIDs: nil, groupMemberNames: nil, ttl: 0, timestamp: Date()
         )
         guard let data = try? JSONEncoder().encode(packet) else { return }
         try? session.send(data, toPeers: peers, with: .reliable)
@@ -205,6 +305,10 @@ extension MeshManager: MCSessionDelegate {
             case .connected:
                 self.sendIdentity(to: [peerID])
             case .notConnected:
+                if let identity = self.identityByMCPeer[peerID] {
+                    self.lastSeenByPeer[identity] = Date()
+                    self.mcPeerByIdentity.removeValue(forKey: identity)
+                }
                 self.identityByMCPeer.removeValue(forKey: peerID)
                 self.refreshConnectedPeersList()
             case .connecting:
@@ -239,7 +343,6 @@ extension MeshManager: MCNearbyServiceAdvertiserDelegate {
 
 extension MeshManager: MCNearbyServiceBrowserDelegate {
     func browser(_ browser: MCNearbyServiceBrowser, foundPeer peerID: MCPeerID, withDiscoveryInfo info: [String: String]?) {
-        // Auto-invite. Avoid duplicate invites to already-connected peers.
         guard !session.connectedPeers.contains(peerID) else { return }
         browser.invitePeer(peerID, to: session, withContext: nil, timeout: 15)
     }
