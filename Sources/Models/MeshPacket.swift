@@ -20,6 +20,7 @@ struct MeshPacket: Codable {
     let type: PacketType
     let originID: UUID            // persistent identity of whoever authored this
     let originName: String
+    let photoData: Data?          // small JPEG thumbnail, .identity packets only; nil = no photo set
     let destinationID: UUID?      // set for 1:1 packets; nil for group/broadcast packets
     let groupID: UUID?            // set for packets that belong to a group conversation
     let text: String?             // message text, edited text, or group name
