@@ -13,6 +13,11 @@ struct GroupInfoView: View {
         chatStore.conversations.first(where: { $0.id == conversationID })
     }
 
+    private func initials(for memberID: UUID) -> String {
+        let parts = chatStore.displayName(for: memberID).split(separator: " ")
+        return String(parts.prefix(2).compactMap { $0.first }).uppercased()
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -36,10 +41,10 @@ struct GroupInfoView: View {
                     Section("Members") {
                         ForEach(conversation.memberIDs, id: \.self) { memberID in
                             HStack {
-                                Circle()
-                                    .fill(Color.green.opacity(0.2))
-                                    .frame(width: 32, height: 32)
-                                    .overlay(Image(systemName: "person.fill").font(.caption).foregroundStyle(.green))
+                                AvatarView(
+                                    photoData: memberID == mesh.myID ? mesh.myPhotoData : mesh.photoByIdentity[memberID],
+                                    initials: initials(for: memberID), tint: .green, size: 32
+                                )
                                 Text(chatStore.displayName(for: memberID))
                                 Spacer()
                                 if mesh.connectedPeers.contains(where: { $0.id == memberID }) {
