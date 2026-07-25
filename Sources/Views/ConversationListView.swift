@@ -5,6 +5,7 @@ struct ConversationListView: View {
     @EnvironmentObject var chatStore: ChatStore
     @State private var showingNewChat = false
     @State private var showingNewGroup = false
+    @State private var showingProfile = false
     @State private var pendingNewPeer: MeshPeer?
     @State private var openConversationID: UUID?
 
@@ -16,6 +17,16 @@ struct ConversationListView: View {
         NavigationStack {
             List {
                 Section {
+                    Button { showingProfile = true } label: {
+                        HStack(spacing: 12) {
+                            AvatarView(photoData: mesh.myPhotoData, initials: myInitials, tint: .green, size: 44)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(mesh.myDisplayName).font(.body.weight(.medium)).foregroundStyle(.primary)
+                                Text("Tap to edit your profile").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+
                     HStack {
                         Circle()
                             .fill(mesh.connectedPeers.isEmpty ? Color.gray : Color.green)
@@ -78,6 +89,7 @@ struct ConversationListView: View {
             .sheet(isPresented: $showingNewGroup) {
                 NewGroupView { groupID in openConversationID = groupID }
             }
+            .sheet(isPresented: $showingProfile) { ProfileView() }
             .navigationDestination(item: $pendingNewPeer) { peer in
                 ChatView(conversationID: peer.id)
             }
@@ -87,12 +99,21 @@ struct ConversationListView: View {
         }
     }
 
+    private var myInitials: String {
+        let parts = mesh.myDisplayName.split(separator: " ")
+        return String(parts.prefix(2).compactMap { $0.first }).uppercased()
+    }
+
     @ViewBuilder
     private func conversationRow(_ conversation: Conversation) -> some View {
         NavigationLink {
             ChatView(conversationID: conversation.id)
         } label: {
-            ConversationRow(conversation: conversation, isOnline: mesh.connectedPeers.contains(where: { $0.id == conversation.id }))
+            ConversationRow(
+                conversation: conversation,
+                isOnline: mesh.connectedPeers.contains(where: { $0.id == conversation.id }),
+                photoData: conversation.isGroup ? nil : mesh.photoByIdentity[conversation.id]
+            )
         }
         .swipeActions(edge: .trailing) {
             Button(role: .destructive) {
@@ -122,22 +143,19 @@ struct ConversationListView: View {
 struct ConversationRow: View {
     let conversation: Conversation
     var isOnline: Bool = false
+    var photoData: Data? = nil
 
     var body: some View {
         HStack(spacing: 12) {
             ZStack(alignment: .bottomTrailing) {
-                Circle()
-                    .fill(conversation.isGroup ? Color.blue.opacity(0.15) : Color.green.opacity(0.2))
-                    .frame(width: 44, height: 44)
-                    .overlay(
-                        Group {
-                            if conversation.isGroup {
-                                Image(systemName: "person.3.fill").foregroundStyle(.blue)
-                            } else {
-                                Text(initials).font(.headline).foregroundStyle(.green)
-                            }
-                        }
-                    )
+                if conversation.isGroup {
+                    Circle()
+                        .fill(Color.blue.opacity(0.15))
+                        .frame(width: 44, height: 44)
+                        .overlay(Image(systemName: "person.3.fill").foregroundStyle(.blue))
+                } else {
+                    AvatarView(photoData: photoData, initials: initials, tint: .green, size: 44)
+                }
                 if isOnline && !conversation.isGroup {
                     Circle().fill(Color.green).frame(width: 11, height: 11)
                         .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2))
