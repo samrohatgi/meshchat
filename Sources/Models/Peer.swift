@@ -10,6 +10,9 @@ struct MeshPeer: Identifiable, Hashable {
     var mcPeerID: MCPeerID?
     var isConnectedDirectly: Bool
     var lastSeen: Date
+    /// Small JPEG thumbnail, if this peer has set a profile picture. Shared
+    /// over the mesh as part of the identity handshake - nil means no photo.
+    var photoData: Data?
 
     static func == (lhs: MeshPeer, rhs: MeshPeer) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
