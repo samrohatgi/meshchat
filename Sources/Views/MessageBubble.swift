@@ -3,10 +3,15 @@ import SwiftUI
 struct MessageBubble: View {
     let message: ChatMessage
     var showSenderName: Bool = false
+    var senderPhotoData: Data? = nil
 
     var body: some View {
-        HStack {
+        HStack(alignment: .bottom, spacing: 6) {
             if message.isOutgoing { Spacer(minLength: 40) }
+
+            if showSenderName && !message.isOutgoing {
+                AvatarView(photoData: senderPhotoData, initials: senderInitials, tint: senderColor, size: 24)
+            }
 
             VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 3) {
                 if message.isDeletedForEveryone {
@@ -131,6 +136,12 @@ struct MessageBubble: View {
         let palette: [Color] = [.blue, .purple, .orange, .pink, .teal, .indigo]
         let hash = abs(message.senderID.uuidString.hashValue)
         return palette[hash % palette.count]
+    }
+
+    private var senderInitials: String {
+        let parts = message.senderName.split(separator: " ")
+        let letters = parts.prefix(2).compactMap { $0.first }
+        return String(letters).uppercased()
     }
 
     // MARK: Lightweight text formatting: *bold*, _italic_, ~strike~
